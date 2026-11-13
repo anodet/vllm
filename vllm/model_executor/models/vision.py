@@ -147,6 +147,18 @@ def is_vit_use_data_parallel(num_heads: int | None = None) -> bool:
         else None
     )
     if num_heads is not None and not can_split:
+        vllm_config = get_current_vllm_config_or_none()
+        lora_config = vllm_config.lora_config if vllm_config is not None else None
+        if lora_config is not None and lora_config.enable_tower_connector_lora:
+            # A data-parallel vision encoder runs each rank on a subset of the
+            # images, which the tower/connector LoRA mapping does not follow.
+            raise ValueError(
+                f"The number of vision attention heads ({num_heads}) is not "
+                "divisible by the tensor parallel size, so the vision encoder "
+                "would fall back to data parallelism, which "
+                "enable_tower_connector_lora does not support. Use a tensor "
+                "parallel size that divides the vision heads."
+            )
         logger.warning_once(
             "The number of vision attention heads is not divisible by "
             "the tensor parallel size. Falling back to data parallelism "

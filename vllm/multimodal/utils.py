@@ -327,6 +327,19 @@ def group_and_batch_mm_kwargs(
             yield modality, num_items, mm_kwargs_batch
 
 
+def count_mm_batches(mm_kwargs: list[tuple[str, MultiModalKwargsItem]]) -> int:
+    """The number of batches `group_and_batch_mm_kwargs` splits `mm_kwargs` into,
+    without building them."""
+    num_batches = 0
+    for _, group in groupby(mm_kwargs, key=lambda x: x[0]):
+        items = [item for _, item in group]
+        num_batches += 1 + sum(
+            not _can_batch_mm_items(left, right)
+            for left, right in zip(items, items[1:])
+        )
+    return num_batches
+
+
 def fetch_audio(
     audio_url: str,
     audio_io_kwargs: dict[str, Any] | None = None,

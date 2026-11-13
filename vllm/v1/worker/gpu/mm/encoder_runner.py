@@ -19,7 +19,7 @@ from vllm.multimodal.utils import (
     set_mm_embedding_modality,
 )
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
-from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache, is_new_encoder_input
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
     sanity_check_mm_encoder_outputs,
@@ -87,9 +87,11 @@ class EncoderRunner:
             mm_features = self.encoder_cache.mm_features[req_id]
             for mm_input_id in encoder_input_ids:
                 mm_feature = mm_features[mm_input_id]
-                if mm_feature.data is None:
-                    continue
-                if mm_feature.identifier in self.encoder_cache.encoder_outputs:
+                # Keep in step with is_encoder_input, which the tower/connector
+                # LoRA mapping uses to cover exactly the items encoded here.
+                if not is_new_encoder_input(
+                    mm_feature, self.encoder_cache.encoder_outputs
+                ):
                     continue
                 if mm_feature.modality == "prompt_embeds":
                     # Passthrough modality: the tensor is already in the

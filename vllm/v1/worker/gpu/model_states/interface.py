@@ -199,6 +199,7 @@ class ModelState(ABC):
         mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
             scheduled_encoder_inputs
         )
+        self.encoder_cache.check_lora_mapping(mm_hashes, mm_kwargs)
         if mm_kwargs:
             with self.encoder_runner.timed_encoder_operation(
                 scheduled_encoder_inputs.keys()

@@ -2082,6 +2082,7 @@ class VllmConfig:
         self._resolve_mm_processor_device()
         self._resolve_mm_video_decode_device()
         self._validate_mm_processor_device()
+        self._validate_tower_connector_lora()
 
         if self.use_v2_model_runner:
             self._disable_cudagraphs_for_v2_stock_torch_compile()
@@ -3392,6 +3393,36 @@ class VllmConfig:
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compilation_config.max_cudagraph_capture_size = 0
         compilation_config.cudagraph_capture_sizes = []
+
+    def _validate_tower_connector_lora(self) -> None:
+        """Refuse settings that run the vision tower on a different set of rows
+        than the per-step tower/connector LoRA mapping describes. The LoRA
+        kernels take their row ranges from the mapping, so a mismatch reads and
+        writes past the encoder input (a CUDA illegal memory access)."""
+        if not (self.lora_config and self.lora_config.enable_tower_connector_lora):
+            return
+        if (
+            self.compilation_config.cudagraph_mm_encoder
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+        ):
+            raise ValueError(
+                "enable_tower_connector_lora does not support cudagraph_mm_encoder: "
+                "encoder CUDA graphs re-order, split and pad the vision batch, "
+                "which the tower/connector LoRA mapping does not follow."
+            )
+        mm_config = getattr(self.model_config, "multimodal_config", None)
+        if (
+            mm_config is not None
+            and mm_config.mm_encoder_tp_mode == "data"
+            and self.parallel_config.tensor_parallel_size > 1
+        ):
+            raise ValueError(
+                "enable_tower_connector_lora does not support "
+                "mm_encoder_tp_mode='data' with tensor_parallel_size > 1: each "
+                "rank encodes a subset of the images, but the tower/connector "
+                "LoRA mapping covers all of them."
+            )
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""

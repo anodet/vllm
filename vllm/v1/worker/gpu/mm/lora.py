@@ -1,14 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from typing import Any
 
 import numpy as np
 
+from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.lora.worker_manager import WorkerLoRAManager
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.worker.gpu.lora_utils import LoraState
-from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache, is_encoder_input
+
+logger = init_logger(__name__)
+
+# Debug aid, not needed for correctness: with VLLM_LOG_MM_LORA_SKIPS=1, log (at most
+# once a minute) how many scheduled items the mapping has left out because the
+# encoder skips them, and how many tower rows they would have added beyond the
+# encoder input without that filter.
+_LOG_SKIPS = os.environ.get("VLLM_LOG_MM_LORA_SKIPS") == "1"
+_skip_stats = {"cached": 0, "no_data": 0, "rows": 0, "steps": 0, "logged": 0, "t": 0.0}
+
+
+def _count_skipped(model: Any, mm_features, input_ids, encoder_outputs) -> None:
+    stats = _skip_stats
+    skipped = 0
+    for i in input_ids:
+        feature = mm_features[i]
+        if feature.modality == "prompt_embeds" or is_encoder_input(
+            feature, encoder_outputs
+        ):
+            continue
+        skipped += 1
+        stats["no_data" if feature.data is None else "cached"] += 1
+        stats["rows"] += model.get_mm_lora_token_counts(
+            modality=feature.modality,
+            mm_kwargs=feature.data,
+            num_mm_embeds=feature.mm_position.get_num_embeds(),
+        )[0]
+    if not skipped:
+        return
+    stats["steps"] += 1
+    total = stats["cached"] + stats["no_data"]
+    now = time.monotonic()
+    if total > stats["logged"] and now - stats["t"] >= 60:
+        logger.info(
+            "Tower/connector LoRA mapping has left out %d already-cached and %d "
+            "no-data scheduled items in %d steps (%d tower rows that the "
+            "unfiltered mapping would have had beyond the encoder input)",
+            stats["cached"],
+            stats["no_data"],
+            stats["steps"],
+            stats["rows"],
+        )
+        stats["logged"], stats["t"] = total, now
 
 
 def set_active_mm_loras(
@@ -40,19 +86,35 @@ def set_active_mm_loras(
 
         lora_id = int(lora_state.lora_ids[req_idx])
         mm_features = encoder_cache.mm_features[req_id]
-        # "prompt_embeds" is a passthrough modality: the tensor is already in
-        # the model's embedding space, so no encoder runs and there is no
-        # tower or connector output to apply LoRA to.
+        # Only the items the encoder runs (is_encoder_input): not items with no
+        # payload, not items the worker already holds (an entry the scheduler
+        # evicted and allocated again within one pass), and not the
+        # "prompt_embeds" passthrough modality. A mapping with rows for items
+        # the encoder skips makes the tower/connector LoRA kernels index past
+        # the encoder input, an illegal memory access.
         mm_items.extend(
             (lora_id, mm_features[i])
             for i in encoder_input_ids
-            if mm_features[i].modality != "prompt_embeds"
+            if is_encoder_input(mm_features[i], encoder_cache.encoder_outputs)
         )
+        if _LOG_SKIPS:
+            _count_skipped(
+                model, mm_features, encoder_input_ids, encoder_cache.encoder_outputs
+            )
 
         if lora_id > 0:
             lora_request = lora_state.lora_requests.get(req_id)
             if lora_request is not None:
                 lora_requests.add(lora_request)
+
+    # Checked against the encoder's own list before it runs (check_lora_mapping).
+    # A mapping without LoRA rows cannot overrun: the kernels return before
+    # reading it. An empty one is checked too, since it leaves the previous
+    # step's mapping in place.
+    has_lora_rows = any(lora_id > 0 for lora_id, _ in mm_items)
+    encoder_cache.lora_mapped_identifiers = (
+        [f.identifier for _, f in mm_items] if has_lora_rows or not mm_items else None
+    )
 
     # Runs items sorted by modality.
     mm_items.sort(key=lambda x: x[1].modality)
